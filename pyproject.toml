@@ -1,8 +1,39 @@
-# To get the tests to pass when the repo is first copied
-
 [project]
-name = "datasette-plugin-template-repository"
+name = "datasette-mcp"
 version = "0.1"
+description = "Adds a /-/mcp MCP server to any Datasette instance"
+readme = "README.md"
+authors = [{name = "Datasette"}]
+license = "Apache-2.0"
+classifiers=[
+    "Framework :: Datasette"
+]
+requires-python = ">=3.10"
+dependencies = [
+    "datasette"
+]
 
-[project.optional-dependencies]
-test = ["pytest"]
+[dependency-groups]
+dev = [
+    "pytest",
+    "pytest-asyncio"
+]
+
+[build-system]
+requires = ["setuptools"]
+build-backend = "setuptools.build_meta"
+
+
+[project.urls]
+Homepage = "https://github.com/datasette/datasette-mcp"
+Changelog = "https://github.com/datasette/datasette-mcp/releases"
+Issues = "https://github.com/datasette/datasette-mcp/issues"
+CI = "https://github.com/datasette/datasette-mcp/actions"
+
+[project.entry-points.datasette]
+mcp = "datasette_mcp"
+
+[tool.pytest.ini_options]
+asyncio_mode = "strict"
+asyncio_default_fixture_loop_scope = "function"
+
