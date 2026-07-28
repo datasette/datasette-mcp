@@ -1,0 +1,8 @@
+# To get the tests to pass when the repo is first copied
+
+[project]
+name = "datasette-plugin-template-repository"
+version = "0.1"
+
+[project.optional-dependencies]
+test = ["pytest"]
