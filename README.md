@@ -32,7 +32,8 @@ default:
   columns, rows, and a truncation indicator.
 
 Datasette database visibility and `execute-sql` permissions are enforced for
-every tool call.
+every tool call. SQL uses the same `validate_sql_select()` and read-only
+`Database.execute()` path as Datasette's custom SQL interface.
 
 ## Registering additional MCP tools
 

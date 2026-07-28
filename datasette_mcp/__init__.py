@@ -6,9 +6,9 @@ from typing import TYPE_CHECKING, Any, Union
 from weakref import WeakKeyDictionary
 
 from datasette import hookimpl
+from datasette.database import QueryInterrupted, Results
 from datasette.plugins import pm
-from datasette.tracer import trace
-from datasette.utils import sqlite3, sqlite_timelimit
+from datasette.utils import InvalidSql, sqlite3, validate_sql_select
 from mcp.server.mcpserver import Context, MCPServer
 from mcp.types import ToolAnnotations
 from pydantic import BaseModel, ConfigDict, Field
@@ -49,13 +49,6 @@ class QueryResults(TypedDict):
 
 
 @dataclass
-class _QueryExecution:
-    columns: list[str]
-    rows: list[tuple[Any, ...]]
-    truncated: bool
-
-
-@dataclass
 class _MCPState:
     server: MCPServer
     app: Any
@@ -65,14 +58,6 @@ READ_ONLY_ANNOTATIONS = ToolAnnotations(
     read_only_hint=True,
     open_world_hint=False,
 )
-
-_ALLOWED_SQLITE_ACTIONS = {
-    sqlite3.SQLITE_FUNCTION,
-    sqlite3.SQLITE_READ,
-    sqlite3.SQLITE_SELECT,
-}
-if hasattr(sqlite3, "SQLITE_RECURSIVE"):
-    _ALLOWED_SQLITE_ACTIONS.add(sqlite3.SQLITE_RECURSIVE)
 
 _states: WeakKeyDictionary[Datasette, _MCPState] = WeakKeyDictionary()
 
@@ -274,78 +259,20 @@ async def _get_visible_database(
 async def _execute_read_only_sql(
     database: Database,
     sql: str,
-) -> _QueryExecution:
-    denied = False
-
-    def authorizer(
-        action: int,
-        argument_one: str | None,
-        argument_two: str | None,
-        database_name: str | None,
-        trigger_name: str | None,
-    ) -> int:
-        del database_name, trigger_name
-        nonlocal denied
-        function_name = argument_two or argument_one or ""
-        if action in _ALLOWED_SQLITE_ACTIONS and not (
-            action == sqlite3.SQLITE_FUNCTION
-            and function_name.lower() == "load_extension"
-        ):
-            return sqlite3.SQLITE_OK
-        denied = True
-        return sqlite3.SQLITE_DENY
-
-    def execute_on_connection(connection: Any) -> _QueryExecution:
-        query_only_was_enabled = bool(
-            connection.execute("pragma query_only").fetchone()[0]
+) -> Results:
+    try:
+        validate_sql_select(sql)
+        return await database.execute(
+            sql,
+            truncate=True,
+            log_sql_errors=False,
         )
-        connection.execute("pragma query_only = on")
-        connection.set_authorizer(authorizer)
-        try:
-            with sqlite_timelimit(
-                connection,
-                database.ds.sql_time_limit_ms,
-            ):
-                cursor = connection.cursor()
-                try:
-                    cursor.execute(sql)
-                    if cursor.description is None:
-                        raise ValueError("SQL must contain exactly one statement.")
-                    columns = [column[0] for column in cursor.description]
-                    max_rows = database.ds.max_returned_rows
-                    if max_rows:
-                        rows = cursor.fetchmany(max_rows + 1)
-                        truncated = len(rows) > max_rows
-                        rows = rows[:max_rows]
-                    else:
-                        rows = cursor.fetchall()
-                        truncated = False
-                    return _QueryExecution(
-                        columns=columns,
-                        rows=[tuple(row) for row in rows],
-                        truncated=truncated,
-                    )
-                except sqlite3.ProgrammingError as ex:
-                    if "one statement at a time" in str(ex):
-                        raise ValueError(
-                            "SQL must contain exactly one statement."
-                        ) from None
-                    raise ValueError(f"SQL error: {ex}") from None
-                except sqlite3.DatabaseError as ex:
-                    if denied or "readonly" in str(ex).lower():
-                        raise ValueError("Only read-only SQL is allowed.") from None
-                    if ex.args == ("interrupted",):
-                        raise ValueError(
-                            "SQL query exceeded the configured time limit."
-                        ) from None
-                    raise ValueError(f"SQL error: {ex}") from None
-        finally:
-            connection.set_authorizer(None)
-            if not query_only_was_enabled:
-                connection.execute("pragma query_only = off")
-
-    with trace("sql", database=database.name, sql=sql.strip(), params=None):
-        return await database.execute_fn(execute_on_connection)
+    except InvalidSql as ex:
+        raise ValueError(str(ex)) from None
+    except QueryInterrupted:
+        raise ValueError("SQL query exceeded the configured time limit.") from None
+    except sqlite3.DatabaseError as ex:
+        raise ValueError(f"SQL error: {ex}") from None
 
 
 def _serialize_cell(value: object) -> CellValue:

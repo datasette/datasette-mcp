@@ -27,8 +27,8 @@ Datasette and `mcp>=2.0.0`, on Python 3.10 or later.
 - Return typed, structured tool results that are useful to both models and MCP
   host applications.
 - Honor Datasette's database visibility and SQL execution permissions.
-- Enforce read-only behavior on the server, independently of MCP tool
-  annotations or client behavior.
+- Use Datasette's own custom-SQL validation and read-only query execution
+  semantics rather than implementing a separate SQLite execution path.
 
 ## Non-goals
 
@@ -244,27 +244,21 @@ results.
   `rows` only if SQLite reports no result columns. A `SELECT` matching no rows
   still reports its result columns.
 
-### Read-only enforcement
+### Datasette query semantics
 
-Read-only behavior must be enforced at execution time, not by string-prefix
-checks alone.
+`execute_sql` must use the same validation and execution path as Datasette's
+custom SQL interface.
 
-- Execute through the selected Datasette `Database` so Datasette's connection
-  preparation, SQL time limit, tracing, and maximum-row behavior continue to
-  apply.
-- Install a SQLite authorizer for the duration of the statement that allows
-  reading and computation but denies mutation and connection-changing
-  operations. Denied operations include INSERT, UPDATE, DELETE, schema changes,
-  transaction control, ATTACH/DETACH, writable PRAGMAs, and extension loading.
-- Also execute on a read-only/query-only connection. This provides a second
-  barrier for in-memory databases and unusual SQLite statements.
-- Remove the temporary connection authorizer and restore the connection's prior
-  `query_only` setting in a `finally` block so the shared Datasette connection
-  is not left modified after success, failure, timeout, or cancellation.
-- Do not rely solely on `SELECT`/`WITH` prefix matching. Comments, common table
-  expressions, PRAGMAs, and SQLite extensions make prefix checks insufficient.
-- Use `Database.execute(..., truncate=True)`-equivalent behavior so Datasette's
-  SQL time limit and `max_returned_rows` are honored.
+- Call Datasette's `validate_sql_select(sql)` before execution.
+- Execute through the selected Datasette `Database` using
+  `Database.execute(sql, truncate=True)`.
+- Rely on Datasette's read-only connection rather than installing a separate
+  SQLite authorizer or changing connection PRAGMAs in this plugin.
+- This delegates connection preparation, SQL functions and extensions,
+  tracing, time limits, maximum-row truncation, and SQLite error behavior to
+  Datasette.
+- Do not implement a second cursor execution or result-fetching loop in
+  datasette-mcp.
 
 ## Error behavior
 
@@ -275,8 +269,8 @@ Representative messages:
 
 - `Database 'name' does not exist or is not available.`
 - `You do not have permission to execute SQL against database 'name'.`
-- `Only read-only SQL is allowed.`
-- `SQL must contain exactly one statement.`
+- `Statement must be a SELECT`
+- `SQL error: You can only execute one statement at a time.`
 - `SQL error: no such column: example`
 - `SQL query exceeded the configured time limit.`
 
@@ -310,8 +304,9 @@ The feature is complete when all of the following are covered:
 9. INSERT, UPDATE, DELETE, CREATE, DROP, ALTER, REPLACE, ATTACH, DETACH,
    transaction statements, writable PRAGMAs, and multiple statements are
    rejected, including on a mutable in-memory database.
-10. A rejected write leaves the database unchanged, and a subsequent valid
-    read succeeds, demonstrating that authorizer cleanup occurred.
+10. Query execution delegates to `Database.execute(..., truncate=True)`. A
+    rejected write leaves the database unchanged and a subsequent valid read
+    succeeds.
 11. Schema and query access are rejected when the relevant Datasette
     permissions are denied.
 12. The MCP session manager starts exactly once for a Datasette application

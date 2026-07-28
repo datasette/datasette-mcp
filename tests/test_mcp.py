@@ -162,6 +162,34 @@ async def test_execute_sql_returns_structured_rows(mcp_server):
     }
 
 
+@pytest.mark.asyncio
+async def test_execute_sql_delegates_to_datasette_database_execute(
+    datasette,
+    monkeypatch,
+):
+    database = datasette.get_database("test")
+    original_execute = database.execute
+    calls = []
+
+    async def execute(sql, **kwargs):
+        calls.append((sql, kwargs))
+        return await original_execute(sql, **kwargs)
+
+    monkeypatch.setattr(database, "execute", execute)
+
+    async with Client(create_mcp_server(datasette), raise_exceptions=True) as client:
+        result = await client.call_tool(
+            "execute_sql",
+            {"database": "test", "sql": "select 42 as answer"},
+        )
+
+    assert result.structured_content["rows"] == [[42]]
+    assert calls[-1] == (
+        "select 42 as answer",
+        {"truncate": True, "log_sql_errors": False},
+    )
+
+
 def tool_error_text(result):
     assert result.is_error is True
     return "\n".join(content.text for content in result.content)
@@ -325,7 +353,6 @@ async def test_execute_sql_permission_is_enforced(tmp_path):
         "detach database forbidden",
         "begin",
         "pragma user_version = 1",
-        "select load_extension('forbidden')",
     ),
 )
 @pytest.mark.asyncio
@@ -336,7 +363,7 @@ async def test_execute_sql_rejects_non_read_only_operations(mcp_server, sql):
             {"database": "test", "sql": sql},
         )
 
-    assert "Only read-only SQL is allowed." in tool_error_text(result)
+    assert "Statement must be a SELECT" in tool_error_text(result)
 
 
 @pytest.mark.asyncio
@@ -347,7 +374,7 @@ async def test_execute_sql_rejects_multiple_statements(mcp_server):
             {"database": "test", "sql": "select 1; select 2"},
         )
 
-    assert "SQL must contain exactly one statement." in tool_error_text(result)
+    assert "one statement at a time" in tool_error_text(result)
 
 
 @pytest.mark.parametrize("sql", ("", "  -- no statement\n"))
@@ -359,11 +386,11 @@ async def test_execute_sql_rejects_missing_statement(mcp_server, sql):
             {"database": "test", "sql": sql},
         )
 
-    assert "SQL must contain exactly one statement." in tool_error_text(result)
+    assert "Statement must be a SELECT" in tool_error_text(result)
 
 
 @pytest.mark.asyncio
-async def test_read_only_barrier_covers_mutable_unnamed_memory_database():
+async def test_execute_sql_rejects_non_select_on_memory_database():
     datasette = Datasette(memory=True)
 
     async with Client(create_mcp_server(datasette)) as client:
@@ -379,7 +406,7 @@ async def test_read_only_barrier_covers_mutable_unnamed_memory_database():
             {"database": "_memory", "sql": "select 1 as value"},
         )
 
-    assert "Only read-only SQL is allowed." in tool_error_text(rejected)
+    assert "Statement must be a SELECT" in tool_error_text(rejected)
     assert subsequent_read.structured_content == {
         "database": "_memory",
         "columns": ["value"],
