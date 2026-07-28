@@ -9,8 +9,10 @@ jobs:
   test:
     runs-on: ubuntu-latest
     strategy:
+      fail-fast: false
       matrix:
         python-version: ["3.10", "3.11", "3.12", "3.13", "3.14"]
+        datasette-version: ["<1.0", ">=1.0a37"]
     steps:
     - uses: actions/checkout@v7
     - name: Set up Python ${{ matrix.python-version }}
@@ -21,7 +23,7 @@ jobs:
         cache-dependency-path: pyproject.toml
     - name: Install dependencies
       run: |
-        pip install . --group dev
+        pip install . --group dev "datasette${{ matrix.datasette-version }}"
     - name: Run tests
       run: |
         if [ -d tests/ ]; then

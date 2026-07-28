@@ -1,5 +1,17 @@
+import asyncio
+from contextlib import asynccontextmanager
+
+from mcp import Client
+from mcp.client.streamable_http import streamable_http_client
+from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
+from datasette import hookimpl
 from datasette.app import Datasette
+from datasette.plugins import pm
+import httpx2
 import pytest
+import pytest_asyncio
+
+from datasette_mcp import create_mcp_server, skip_csrf
 
 
 @pytest.mark.asyncio
@@ -9,3 +21,471 @@ async def test_plugin_is_installed():
     assert response.status_code == 200
     installed_plugins = {p["name"] for p in response.json()}
     assert "datasette-mcp" in installed_plugins
+
+
+@pytest_asyncio.fixture
+async def datasette(tmp_path):
+    datasette = Datasette([str(tmp_path / "test.db")])
+    database = datasette.get_database("test")
+    await database.execute_write_script(
+        """
+        create table authors (
+            id integer primary key,
+            name text not null
+        );
+        create index authors_name_idx on authors(name);
+        create view author_names as
+            select name from authors;
+        create trigger authors_uppercase
+            after insert on authors
+            when new.name != upper(new.name)
+        begin
+            update authors set name = upper(new.name) where id = new.id;
+        end;
+        insert into authors (name) values ('Ada'), ('Grace');
+        """
+    )
+    return datasette
+
+
+@pytest_asyncio.fixture
+async def mcp_server(datasette):
+    return create_mcp_server(datasette)
+
+
+@pytest.mark.asyncio
+async def test_server_exposes_exactly_three_read_only_tools(mcp_server):
+    async with Client(mcp_server, raise_exceptions=True) as client:
+        tools = (await client.list_tools()).tools
+
+    assert [tool.name for tool in tools] == [
+        "list_databases",
+        "get_database_schema",
+        "execute_sql",
+    ]
+    for tool in tools:
+        assert tool.input_schema
+        assert tool.output_schema
+        assert tool.description
+        assert tool.annotations.read_only_hint is True
+        assert tool.annotations.open_world_hint is False
+
+
+def test_default_tools_are_registered_by_plugin_hook():
+    implementations = pm.hook.register_mcp_tools.get_hookimpls()
+
+    assert any(
+        implementation.function.__module__ == "datasette_mcp"
+        for implementation in implementations
+    )
+
+
+@pytest.mark.asyncio
+async def test_another_plugin_can_register_an_mcp_tool(datasette):
+    seen_datasette = None
+
+    class ExtraToolsPlugin:
+        @hookimpl
+        def register_mcp_tools(self, datasette, mcp):
+            nonlocal seen_datasette
+            seen_datasette = datasette
+
+            @mcp.tool()
+            async def reverse_text(text: str) -> str:
+                """Reverse the supplied text."""
+                return text[::-1]
+
+    plugin = ExtraToolsPlugin()
+    pm.register(plugin, name="ExtraToolsPlugin")
+    try:
+        async with Client(create_mcp_server(datasette)) as client:
+            tools = await client.list_tools()
+            result = await client.call_tool(
+                "reverse_text",
+                {"text": "Datasette"},
+            )
+    finally:
+        pm.unregister(name="ExtraToolsPlugin")
+
+    assert seen_datasette is datasette
+    assert "reverse_text" in {tool.name for tool in tools.tools}
+    assert result.structured_content == {"result": "ettesataD"}
+
+
+@pytest.mark.asyncio
+async def test_list_databases(mcp_server):
+    async with Client(mcp_server, raise_exceptions=True) as client:
+        result = await client.call_tool("list_databases")
+
+    assert result.is_error is False
+    assert result.structured_content == {"databases": ["test"]}
+
+
+@pytest.mark.asyncio
+async def test_get_database_schema_includes_all_schema_object_types(mcp_server):
+    async with Client(mcp_server, raise_exceptions=True) as client:
+        result = await client.call_tool("get_database_schema", {"database": "test"})
+
+    assert result.is_error is False
+    schema = result.structured_content["schema"]
+    assert "CREATE TABLE authors" in schema
+    assert "CREATE INDEX authors_name_idx" in schema
+    assert "CREATE VIEW author_names" in schema
+    assert "CREATE TRIGGER authors_uppercase" in schema
+    assert result.structured_content["database"] == "test"
+
+
+@pytest.mark.asyncio
+async def test_execute_sql_returns_structured_rows(mcp_server):
+    async with Client(mcp_server, raise_exceptions=True) as client:
+        result = await client.call_tool(
+            "execute_sql",
+            {
+                "database": "test",
+                "sql": """
+                    select id, name, null as missing, x'0001' as payload
+                    from authors
+                    order by id
+                """,
+            },
+        )
+
+    assert result.is_error is False
+    assert result.structured_content == {
+        "database": "test",
+        "columns": ["id", "name", "missing", "payload"],
+        "rows": [
+            [1, "ADA", None, {"base64": "AAE="}],
+            [2, "GRACE", None, {"base64": "AAE="}],
+        ],
+        "truncated": False,
+    }
+
+
+def tool_error_text(result):
+    assert result.is_error is True
+    return "\n".join(content.text for content in result.content)
+
+
+@asynccontextmanager
+async def run_asgi_lifespan(app):
+    to_app = asyncio.Queue()
+    from_app = asyncio.Queue()
+    scope = {
+        "type": "lifespan",
+        "asgi": {"version": "3.0", "spec_version": "2.0"},
+        "state": {},
+    }
+    task = asyncio.create_task(app(scope, to_app.get, from_app.put))
+    await to_app.put({"type": "lifespan.startup"})
+    started = await asyncio.wait_for(from_app.get(), timeout=5)
+    assert started == {"type": "lifespan.startup.complete"}
+    try:
+        yield
+    finally:
+        await to_app.put({"type": "lifespan.shutdown"})
+        stopped = await asyncio.wait_for(from_app.get(), timeout=5)
+        assert stopped == {"type": "lifespan.shutdown.complete"}
+        await asyncio.wait_for(task, timeout=5)
+
+
+@asynccontextmanager
+async def mcp_client_for_app(app, path="/-/mcp", cookies=None):
+    async with httpx2.AsyncClient(
+        transport=httpx2.ASGITransport(app=app),
+        base_url="http://localhost",
+        cookies=cookies,
+    ) as http_client:
+        transport = streamable_http_client(
+            f"http://localhost{path}",
+            http_client=http_client,
+        )
+        async with Client(transport, raise_exceptions=True) as client:
+            yield client
+
+
+@asynccontextmanager
+async def mcp_http_client(datasette, path="/-/mcp", cookies=None):
+    app = datasette.app()
+    async with run_asgi_lifespan(app):
+        async with mcp_client_for_app(
+            app,
+            path=path,
+            cookies=cookies,
+        ) as client:
+            yield client
+
+
+@pytest.mark.asyncio
+async def test_empty_database_has_empty_schema(tmp_path):
+    database_path = tmp_path / "empty.db"
+    database_path.touch()
+    datasette = Datasette([str(database_path)])
+
+    async with Client(create_mcp_server(datasette)) as client:
+        result = await client.call_tool("get_database_schema", {"database": "empty"})
+
+    assert result.structured_content == {"database": "empty", "schema": ""}
+
+
+@pytest.mark.asyncio
+async def test_query_results_are_truncated_at_datasette_limit(tmp_path):
+    database_path = tmp_path / "limited.db"
+    database_path.touch()
+    datasette = Datasette(
+        [str(database_path)],
+        settings={"max_returned_rows": 1},
+    )
+
+    async with Client(create_mcp_server(datasette)) as client:
+        result = await client.call_tool(
+            "execute_sql",
+            {
+                "database": "limited",
+                "sql": "select 1 as value union all select 2",
+            },
+        )
+
+    assert result.structured_content == {
+        "database": "limited",
+        "columns": ["value"],
+        "rows": [[1]],
+        "truncated": True,
+    }
+
+
+@pytest.mark.asyncio
+async def test_missing_and_internal_databases_are_not_disclosed(datasette):
+    async with Client(create_mcp_server(datasette)) as client:
+        missing = await client.call_tool("get_database_schema", {"database": "missing"})
+        internal = await client.call_tool(
+            "get_database_schema", {"database": "_internal"}
+        )
+
+    expected = "does not exist or is not available"
+    assert expected in tool_error_text(missing)
+    assert expected in tool_error_text(internal)
+
+
+@pytest.mark.asyncio
+async def test_database_visibility_permission_filters_list_and_schema(tmp_path):
+    database_path = tmp_path / "private.db"
+    database_path.touch()
+    datasette = Datasette(
+        [str(database_path)],
+        metadata={
+            "databases": {
+                "private": {
+                    "allow": {"id": "allowed"},
+                }
+            }
+        },
+    )
+
+    async with Client(create_mcp_server(datasette)) as client:
+        databases = await client.call_tool("list_databases")
+        schema = await client.call_tool("get_database_schema", {"database": "private"})
+
+    assert databases.structured_content == {"databases": []}
+    assert "does not exist or is not available" in tool_error_text(schema)
+
+
+@pytest.mark.asyncio
+async def test_execute_sql_permission_is_enforced(tmp_path):
+    database_path = tmp_path / "restricted.db"
+    database_path.touch()
+    datasette = Datasette(
+        [str(database_path)],
+        settings={"default_allow_sql": False},
+    )
+
+    async with Client(create_mcp_server(datasette)) as client:
+        result = await client.call_tool(
+            "execute_sql",
+            {"database": "restricted", "sql": "select 1"},
+        )
+
+    assert (
+        "You do not have permission to execute SQL against database 'restricted'."
+        in tool_error_text(result)
+    )
+
+
+@pytest.mark.parametrize(
+    "sql",
+    (
+        "insert into authors(name) values ('Katherine')",
+        "update authors set name = 'Katherine' where id = 1",
+        "delete from authors",
+        "create table forbidden(id integer)",
+        "drop table authors",
+        "alter table authors add column forbidden integer",
+        "replace into authors(id, name) values (1, 'Katherine')",
+        "attach database ':memory:' as forbidden",
+        "detach database forbidden",
+        "begin",
+        "pragma user_version = 1",
+        "select load_extension('forbidden')",
+    ),
+)
+@pytest.mark.asyncio
+async def test_execute_sql_rejects_non_read_only_operations(mcp_server, sql):
+    async with Client(mcp_server) as client:
+        result = await client.call_tool(
+            "execute_sql",
+            {"database": "test", "sql": sql},
+        )
+
+    assert "Only read-only SQL is allowed." in tool_error_text(result)
+
+
+@pytest.mark.asyncio
+async def test_execute_sql_rejects_multiple_statements(mcp_server):
+    async with Client(mcp_server) as client:
+        result = await client.call_tool(
+            "execute_sql",
+            {"database": "test", "sql": "select 1; select 2"},
+        )
+
+    assert "SQL must contain exactly one statement." in tool_error_text(result)
+
+
+@pytest.mark.parametrize("sql", ("", "  -- no statement\n"))
+@pytest.mark.asyncio
+async def test_execute_sql_rejects_missing_statement(mcp_server, sql):
+    async with Client(mcp_server) as client:
+        result = await client.call_tool(
+            "execute_sql",
+            {"database": "test", "sql": sql},
+        )
+
+    assert "SQL must contain exactly one statement." in tool_error_text(result)
+
+
+@pytest.mark.asyncio
+async def test_read_only_barrier_covers_mutable_unnamed_memory_database():
+    datasette = Datasette(memory=True)
+
+    async with Client(create_mcp_server(datasette)) as client:
+        rejected = await client.call_tool(
+            "execute_sql",
+            {
+                "database": "_memory",
+                "sql": "create table forbidden(id integer)",
+            },
+        )
+        subsequent_read = await client.call_tool(
+            "execute_sql",
+            {"database": "_memory", "sql": "select 1 as value"},
+        )
+
+    assert "Only read-only SQL is allowed." in tool_error_text(rejected)
+    assert subsequent_read.structured_content == {
+        "database": "_memory",
+        "columns": ["value"],
+        "rows": [[1]],
+        "truncated": False,
+    }
+
+
+@pytest.mark.asyncio
+async def test_mcp_streamable_http_endpoint(datasette):
+    async with mcp_http_client(datasette) as client:
+        tools = await client.list_tools()
+        query = await client.call_tool(
+            "execute_sql",
+            {"database": "test", "sql": "select name from authors order by id"},
+        )
+
+    assert [tool.name for tool in tools.tools] == [
+        "list_databases",
+        "get_database_schema",
+        "execute_sql",
+    ]
+    assert query.structured_content["rows"] == [["ADA"], ["GRACE"]]
+
+
+@pytest.mark.asyncio
+async def test_mcp_endpoint_honors_datasette_base_url(tmp_path):
+    database_path = tmp_path / "prefixed.db"
+    database_path.touch()
+    datasette = Datasette(
+        [str(database_path)],
+        settings={"base_url": "/prefix/"},
+    )
+
+    async with mcp_http_client(datasette, path="/prefix/-/mcp") as client:
+        result = await client.call_tool("list_databases")
+
+    assert result.structured_content == {"databases": ["prefixed"]}
+
+
+def test_csrf_exemption_matches_only_the_mcp_endpoint():
+    datasette = Datasette(
+        memory=True,
+        settings={"base_url": "/prefix/"},
+    )
+
+    assert skip_csrf(datasette, {"path": "/prefix/-/mcp", "method": "POST"}) is True
+    assert skip_csrf(datasette, {"path": "/prefix/-/mcp", "method": "DELETE"}) is True
+    assert (
+        skip_csrf(datasette, {"path": "/prefix/-/mcp/extra", "method": "POST"}) is False
+    )
+    assert skip_csrf(datasette, {"path": "/prefix/-/mcp", "method": "GET"}) is False
+
+
+@pytest.mark.asyncio
+async def test_http_actor_is_used_for_database_permissions(tmp_path):
+    database_path = tmp_path / "private.db"
+    database_path.touch()
+    datasette = Datasette(
+        [str(database_path)],
+        metadata={
+            "databases": {
+                "private": {
+                    "allow": {"id": "allowed"},
+                }
+            }
+        },
+    )
+    actor_cookie = datasette.sign({"a": {"id": "allowed"}}, "actor")
+
+    app = datasette.app()
+    async with run_asgi_lifespan(app):
+        async with mcp_client_for_app(app) as anonymous_client:
+            anonymous = await anonymous_client.call_tool("list_databases")
+        async with mcp_client_for_app(
+            app,
+            cookies={"ds_actor": actor_cookie},
+        ) as allowed_client:
+            allowed = await allowed_client.call_tool("list_databases")
+
+    assert anonymous.structured_content == {"databases": []}
+    assert allowed.structured_content == {"databases": ["private"]}
+
+
+@pytest.mark.asyncio
+async def test_mcp_session_manager_runs_once_per_asgi_lifespan(
+    datasette,
+    monkeypatch,
+):
+    starts = 0
+    stops = 0
+    original_run = StreamableHTTPSessionManager.run
+
+    @asynccontextmanager
+    async def counted_run(manager):
+        nonlocal starts, stops
+        starts += 1
+        async with original_run(manager):
+            yield
+        stops += 1
+
+    monkeypatch.setattr(StreamableHTTPSessionManager, "run", counted_run)
+
+    async with mcp_http_client(datasette) as client:
+        await client.call_tool("list_databases")
+        await client.call_tool("list_databases")
+
+    assert starts == 1
+    assert stops == 1
