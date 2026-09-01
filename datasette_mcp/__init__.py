@@ -39,12 +39,13 @@ class BlobValue(TypedDict):
 
 
 CellValue = Union[str, int, float, bool, None, BlobValue]
+RowValue = dict[str, CellValue]
 
 
 class QueryResults(TypedDict):
     database: str
     columns: list[str]
-    rows: list[list[CellValue]]
+    rows: list[RowValue]
     truncated: bool
 
 
@@ -129,7 +130,7 @@ def register_mcp_tools(datasette: Datasette, mcp: MCPServer) -> None:
 
     @mcp.tool(annotations=READ_ONLY_ANNOTATIONS)
     async def execute_sql(database: str, sql: str, ctx: Context) -> QueryResults:
-        """Execute one read-only SQL statement and return its tabular results."""
+        """Execute one read-only SQL statement and return column-keyed rows."""
         db, actor = await _get_visible_database(datasette, ctx, database)
         if not await _database_permission_allowed(
             datasette,
@@ -142,7 +143,13 @@ def register_mcp_tools(datasette: Datasette, mcp: MCPServer) -> None:
                 f"{database!r}."
             )
         results = await _execute_read_only_sql(db, sql)
-        rows = [[_serialize_cell(value) for value in row] for row in results.rows]
+        rows = [
+            {
+                column: _serialize_cell(value)
+                for column, value in zip(results.columns, row)
+            }
+            for row in results.rows
+        ]
         return {
             "database": database,
             "columns": results.columns,

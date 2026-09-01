@@ -155,8 +155,18 @@ async def test_execute_sql_returns_structured_rows(mcp_server):
         "database": "test",
         "columns": ["id", "name", "missing", "payload"],
         "rows": [
-            [1, "ADA", None, {"base64": "AAE="}],
-            [2, "GRACE", None, {"base64": "AAE="}],
+            {
+                "id": 1,
+                "name": "ADA",
+                "missing": None,
+                "payload": {"base64": "AAE="},
+            },
+            {
+                "id": 2,
+                "name": "GRACE",
+                "missing": None,
+                "payload": {"base64": "AAE="},
+            },
         ],
         "truncated": False,
     }
@@ -183,7 +193,7 @@ async def test_execute_sql_delegates_to_datasette_database_execute(
             {"database": "test", "sql": "select 42 as answer"},
         )
 
-    assert result.structured_content["rows"] == [[42]]
+    assert result.structured_content["rows"] == [{"answer": 42}]
     assert calls[-1] == (
         "select 42 as answer",
         {"truncate": True, "log_sql_errors": False},
@@ -277,7 +287,7 @@ async def test_query_results_are_truncated_at_datasette_limit(tmp_path):
     assert result.structured_content == {
         "database": "limited",
         "columns": ["value"],
-        "rows": [[1]],
+        "rows": [{"value": 1}],
         "truncated": True,
     }
 
@@ -410,7 +420,7 @@ async def test_execute_sql_rejects_non_select_on_memory_database():
     assert subsequent_read.structured_content == {
         "database": "_memory",
         "columns": ["value"],
-        "rows": [[1]],
+        "rows": [{"value": 1}],
         "truncated": False,
     }
 
@@ -429,7 +439,10 @@ async def test_mcp_streamable_http_endpoint(datasette):
         "get_database_schema",
         "execute_sql",
     ]
-    assert query.structured_content["rows"] == [["ADA"], ["GRACE"]]
+    assert query.structured_content["rows"] == [
+        {"name": "ADA"},
+        {"name": "GRACE"},
+    ]
 
 
 @pytest.mark.asyncio

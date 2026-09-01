@@ -221,14 +221,14 @@ results.
   "database": "database_name",
   "columns": ["column_name"],
   "rows": [
-    ["cell value"]
+    {"column_name": "cell value"}
   ],
   "truncated": false
 }
 ```
 
 - `columns` preserves SQLite result-column order.
-- `rows` is an array of arrays in the same order as `columns`.
+- `rows` is an array of objects keyed by the names in `columns`.
 - Preserve SQLite `NULL`, integer, float, and text values as JSON `null`,
   number, and string values.
 - Encode BLOB values as an object of the following form so they remain
