@@ -10,6 +10,7 @@ from datasette.database import QueryInterrupted, Results
 from datasette.plugins import pm
 from datasette.utils import InvalidSql, sqlite3, validate_sql_select
 from mcp.server.mcpserver import Context, MCPServer
+from mcp.server.mcpserver.exceptions import ToolError
 from mcp.types import ToolAnnotations
 from pydantic import BaseModel, ConfigDict, Field
 from typing_extensions import TypedDict
@@ -138,7 +139,7 @@ def register_mcp_tools(datasette: Datasette, mcp: MCPServer) -> None:
             "execute-sql",
             database,
         ):
-            raise PermissionError(
+            raise ToolError(
                 f"You do not have permission to execute SQL against database "
                 f"{database!r}."
             )
@@ -252,14 +253,14 @@ async def _get_visible_database(
 ) -> tuple[Database, dict[str, Any] | None]:
     actor = _actor_from_context(ctx)
     if database == "_internal" or database not in datasette.databases:
-        raise ValueError(f"Database {database!r} does not exist or is not available.")
+        raise ToolError(f"Database {database!r} does not exist or is not available.")
     if not await _database_permission_allowed(
         datasette,
         actor,
         "view-database",
         database,
     ):
-        raise ValueError(f"Database {database!r} does not exist or is not available.")
+        raise ToolError(f"Database {database!r} does not exist or is not available.")
     return datasette.databases[database], actor
 
 
@@ -275,11 +276,11 @@ async def _execute_read_only_sql(
             log_sql_errors=False,
         )
     except InvalidSql as ex:
-        raise ValueError(str(ex)) from None
+        raise ToolError(str(ex)) from None
     except QueryInterrupted:
-        raise ValueError("SQL query exceeded the configured time limit.") from None
-    except sqlite3.DatabaseError as ex:
-        raise ValueError(f"SQL error: {ex}") from None
+        raise ToolError("SQL query exceeded the configured time limit.") from None
+    except (sqlite3.DatabaseError, sqlite3.Warning) as ex:
+        raise ToolError(f"SQL error: {ex}") from None
 
 
 def _serialize_cell(value: object) -> CellValue:
