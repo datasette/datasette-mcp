@@ -32,7 +32,9 @@ Datasette and `mcp>=2.0.0`, on Python 3.10 or later.
 
 ## Non-goals
 
-- No tools that insert, update, delete, or alter data.
+- No tools that insert, update, delete, or alter data, other than running
+  writable canned queries when the optional canned queries setting is
+  enabled.
 - No MCP resources, prompts, sampling, elicitation, or custom methods.
 - No separate web server, port, or command-line entry point.
 - No replacement authentication system. The endpoint uses the actor already
@@ -259,6 +261,45 @@ custom SQL interface.
   Datasette.
 - Do not implement a second cursor execution or result-fetching loop in
   datasette-mcp.
+
+## Optional canned query tools
+
+Setting `canned_queries: true` in the `datasette-mcp` plugin configuration
+registers three additional tools after the defaults. Without the setting they
+are not registered and do not appear in `tools/list`. Datasette 0.x canned
+queries and Datasette 1.0 stored queries are both supported.
+
+- `list_canned_queries(database=None)` returns `{"queries": [...]}`. Each
+  entry has `database`, `name`, `title`, `description`, `sql` (`null` when
+  the query sets `hide_sql`), `parameters` (caller-supplied parameters,
+  excluding magic parameters that start with `_`) and `write`.
+- `execute_canned_query(database, query, parameters=None)` runs a read-only
+  canned query through `Database.execute(..., truncate=True)` and returns the
+  same output as `execute_sql`. Read-only annotations.
+- `execute_writable_canned_query(database, query, parameters=None)` runs a
+  canned query marked as writable through `Database.execute_write()` and
+  returns `{"database", "query", "message", "rows_affected"}`. Annotated with
+  `read_only_hint=false` and `destructive_hint=true`.
+
+Each tool only accepts the kind of query it is for, and points the model at
+the other tool otherwise. Unknown parameter names are rejected, missing
+parameters default to the empty string, and magic parameters are resolved
+from the MCP HTTP request using Datasette's `MagicParameters`.
+
+Permissions mirror Datasette's query pages for the request actor:
+
+- The database must pass the same visibility check as the other tools.
+- The actor needs `view-query` for the query. Queries the actor cannot view
+  produce the same error as missing queries.
+- On Datasette 1.0, untrusted stored queries also require `execute-sql`
+  (reads) or `execute-write-sql` plus `ensure_query_write_permissions()`
+  (writes). Trusted queries, which include all config-defined queries by
+  default, need only `view-query`.
+- Writes to an immutable database are rejected.
+
+Writable query failures report `on_error_message` when set, otherwise the
+SQLite error. Success messages use `on_success_message_sql` (Datasette 1.0),
+then `on_success_message`, then Datasette's default message.
 
 ## Error behavior
 

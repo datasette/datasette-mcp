@@ -35,6 +35,38 @@ Datasette database visibility and `execute-sql` permissions are enforced for
 every tool call. SQL uses the same `validate_sql_select()` and read-only
 `Database.execute()` path as Datasette's custom SQL interface.
 
+## Canned queries
+
+Datasette [canned queries](https://docs.datasette.io/en/stable/sql_queries.html#canned-queries)
+(called stored queries in Datasette 1.0), including writable canned queries,
+can be exposed as MCP tools by enabling this plugin setting:
+
+```yaml
+plugins:
+  datasette-mcp:
+    canned_queries: true
+```
+
+This adds three more tools:
+
+- `list_canned_queries` lists the canned queries the current actor can view,
+  optionally filtered to one database. Each entry includes the query's name,
+  title, description, SQL (omitted if `hide_sql` is set), the parameters it
+  accepts and whether it writes data.
+- `execute_canned_query` runs a read-only canned query with a dictionary of
+  parameters and returns the same structured results as `execute_sql`.
+- `execute_writable_canned_query` runs a writable canned query and returns its
+  success message and number of affected rows. This tool is annotated as
+  destructive, so MCP clients can ask for confirmation before running it.
+
+Canned queries follow the same permission checks as Datasette's own query
+pages for the actor making the MCP request: the actor needs `view-database`
+and `view-query` permission. On Datasette 1.0, untrusted stored queries also
+need `execute-sql`, or `execute-write-sql` plus the relevant table
+permissions for writes. Missing parameters default to empty strings, as they
+do in Datasette, and magic parameters such as `:_actor_id` are resolved from
+the MCP HTTP request.
+
 ## Registering additional MCP tools
 
 Other Datasette plugins can add tools to this MCP server by implementing the
