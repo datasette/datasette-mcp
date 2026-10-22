@@ -529,3 +529,373 @@ async def test_mcp_session_manager_runs_once_per_asgi_lifespan(
 
     assert starts == 1
     assert stops == 1
+
+
+HAS_STORED_QUERIES = hasattr(Datasette, "get_query")
+
+
+def datasette_with_config(paths, config, **kwargs):
+    # Datasette 1.0 reads queries, permissions, and plugin settings from config=
+    key = "config" if HAS_STORED_QUERIES else "metadata"
+    return Datasette(paths, **{key: config}, **kwargs)
+
+
+CANNED_QUERIES_CONFIG = {
+    "plugins": {"datasette-mcp": {"canned_queries": True}},
+    "databases": {
+        "test": {
+            "queries": {
+                "author_by_name": {
+                    "sql": "select id, name from authors where name = :name",
+                    "title": "Author by name",
+                    "description": "Find an author by exact name",
+                },
+                "secret_sql": {
+                    "sql": "select count(*) as count from authors",
+                    "hide_sql": True,
+                },
+                "add_author": {
+                    "sql": "insert into authors (name) values (:name)",
+                    "write": True,
+                    "on_success_message": "Author added",
+                },
+                "add_author_default_message": {
+                    "sql": "insert into authors (name) values (:name)",
+                    "write": True,
+                },
+                "broken_write": {
+                    "sql": "insert into missing_table (name) values (:name)",
+                    "write": True,
+                    "on_error_message": "Could not add author",
+                },
+                "private_query": {
+                    "sql": "select name from authors",
+                    "allow": {"id": "allowed"},
+                },
+                "add_author_as_actor": {
+                    "sql": (
+                        "insert into authors (name) "
+                        "values (:name || '-' || :_actor_id)"
+                    ),
+                    "write": True,
+                    "allow": {"id": "allowed"},
+                },
+            }
+        }
+    },
+}
+
+
+@pytest_asyncio.fixture
+async def canned_datasette(datasette):
+    path = datasette.get_database("test").path
+    canned = datasette_with_config([path], CANNED_QUERIES_CONFIG)
+    await canned.invoke_startup()
+    return canned
+
+
+@pytest.mark.asyncio
+async def test_canned_query_tools_disabled_by_default(datasette):
+    path = datasette.get_database("test").path
+    without_setting = datasette_with_config(
+        [path],
+        {"databases": CANNED_QUERIES_CONFIG["databases"]},
+    )
+    async with Client(create_mcp_server(without_setting)) as client:
+        tools = (await client.list_tools()).tools
+
+    assert "list_canned_queries" not in {tool.name for tool in tools}
+
+
+@pytest.mark.asyncio
+async def test_canned_query_tools_registered_when_enabled(canned_datasette):
+    async with Client(create_mcp_server(canned_datasette)) as client:
+        tools = {tool.name: tool for tool in (await client.list_tools()).tools}
+
+    assert list(tools) == [
+        "list_databases",
+        "get_database_schema",
+        "execute_sql",
+        "list_canned_queries",
+        "execute_canned_query",
+        "execute_writable_canned_query",
+    ]
+    for name in ("list_canned_queries", "execute_canned_query"):
+        assert tools[name].annotations.read_only_hint is True
+    writable = tools["execute_writable_canned_query"].annotations
+    assert writable.read_only_hint is False
+    assert writable.destructive_hint is True
+    for tool in tools.values():
+        assert tool.output_schema
+        assert tool.description
+
+
+@pytest.mark.asyncio
+async def test_list_canned_queries(canned_datasette):
+    async with Client(
+        create_mcp_server(canned_datasette), raise_exceptions=True
+    ) as client:
+        all_queries = await client.call_tool("list_canned_queries")
+        test_queries = await client.call_tool(
+            "list_canned_queries", {"database": "test"}
+        )
+        missing = await client.call_tool("list_canned_queries", {"database": "missing"})
+
+    queries = {q["name"]: q for q in all_queries.structured_content["queries"]}
+    # Queries with an allow block are hidden from the anonymous actor
+    assert set(queries) == {
+        "author_by_name",
+        "secret_sql",
+        "add_author",
+        "add_author_default_message",
+        "broken_write",
+    }
+    assert queries["author_by_name"] == {
+        "database": "test",
+        "name": "author_by_name",
+        "title": "Author by name",
+        "description": "Find an author by exact name",
+        "sql": "select id, name from authors where name = :name",
+        "parameters": ["name"],
+        "write": False,
+    }
+    assert queries["secret_sql"]["sql"] is None
+    assert queries["add_author"]["write"] is True
+    assert test_queries.structured_content == all_queries.structured_content
+    assert "does not exist or is not available" in tool_error_text(missing)
+
+
+@pytest.mark.asyncio
+async def test_execute_canned_query(canned_datasette):
+    async with Client(create_mcp_server(canned_datasette)) as client:
+        found = await client.call_tool(
+            "execute_canned_query",
+            {
+                "database": "test",
+                "query": "author_by_name",
+                "parameters": {"name": "GRACE"},
+            },
+        )
+        missing_parameter = await client.call_tool(
+            "execute_canned_query",
+            {"database": "test", "query": "author_by_name"},
+        )
+        unknown_parameter = await client.call_tool(
+            "execute_canned_query",
+            {
+                "database": "test",
+                "query": "author_by_name",
+                "parameters": {"nam": "GRACE"},
+            },
+        )
+        missing_query = await client.call_tool(
+            "execute_canned_query",
+            {"database": "test", "query": "missing"},
+        )
+
+    assert found.structured_content == {
+        "database": "test",
+        "columns": ["id", "name"],
+        "rows": [{"id": 2, "name": "GRACE"}],
+        "truncated": False,
+    }
+    assert missing_parameter.structured_content["rows"] == []
+    assert "Unknown parameters for canned query 'author_by_name': nam" in (
+        tool_error_text(unknown_parameter)
+    )
+    assert "Canned query 'missing' does not exist or is not available" in (
+        tool_error_text(missing_query)
+    )
+
+
+@pytest.mark.asyncio
+async def test_read_and_write_canned_query_tools_are_not_interchangeable(
+    canned_datasette,
+):
+    async with Client(create_mcp_server(canned_datasette)) as client:
+        write_as_read = await client.call_tool(
+            "execute_canned_query",
+            {"database": "test", "query": "add_author", "parameters": {"name": "X"}},
+        )
+        read_as_write = await client.call_tool(
+            "execute_writable_canned_query",
+            {"database": "test", "query": "author_by_name"},
+        )
+        count = await client.call_tool(
+            "execute_canned_query", {"database": "test", "query": "secret_sql"}
+        )
+
+    assert "use execute_writable_canned_query" in tool_error_text(write_as_read)
+    assert "use execute_canned_query" in tool_error_text(read_as_write)
+    assert count.structured_content["rows"] == [{"count": 2}]
+
+
+@pytest.mark.asyncio
+async def test_execute_writable_canned_query(canned_datasette):
+    async with Client(create_mcp_server(canned_datasette)) as client:
+        custom_message = await client.call_tool(
+            "execute_writable_canned_query",
+            {
+                "database": "test",
+                "query": "add_author",
+                "parameters": {"name": "Katherine"},
+            },
+        )
+        default_message = await client.call_tool(
+            "execute_writable_canned_query",
+            {
+                "database": "test",
+                "query": "add_author_default_message",
+                "parameters": {"name": "Hedy"},
+            },
+        )
+        broken = await client.call_tool(
+            "execute_writable_canned_query",
+            {"database": "test", "query": "broken_write", "parameters": {"name": "X"}},
+        )
+        names = await client.call_tool(
+            "execute_sql",
+            {"database": "test", "sql": "select name from authors order by id"},
+        )
+
+    assert custom_message.structured_content == {
+        "database": "test",
+        "query": "add_author",
+        "message": "Author added",
+        "rows_affected": 1,
+    }
+    assert default_message.structured_content["message"] == (
+        "Query executed, 1 row affected"
+    )
+    assert "Could not add author" in tool_error_text(broken)
+    assert names.structured_content["rows"] == [
+        {"name": "ADA"},
+        {"name": "GRACE"},
+        {"name": "KATHERINE"},
+        {"name": "HEDY"},
+    ]
+
+
+@pytest.mark.asyncio
+async def test_writable_canned_query_rejected_for_immutable_database(datasette):
+    path = datasette.get_database("test").path
+    canned = datasette_with_config([], CANNED_QUERIES_CONFIG, immutables=[path])
+
+    async with Client(create_mcp_server(canned)) as client:
+        result = await client.call_tool(
+            "execute_writable_canned_query",
+            {"database": "test", "query": "add_author", "parameters": {"name": "X"}},
+        )
+
+    assert "Database 'test' is immutable." in tool_error_text(result)
+
+
+@pytest.mark.asyncio
+async def test_canned_queries_hidden_with_database(datasette):
+    path = datasette.get_database("test").path
+    config = {
+        "plugins": CANNED_QUERIES_CONFIG["plugins"],
+        "databases": {
+            "test": dict(
+                CANNED_QUERIES_CONFIG["databases"]["test"],
+                allow={"id": "allowed"},
+            )
+        },
+    }
+    canned = datasette_with_config([path], config)
+
+    async with Client(create_mcp_server(canned)) as client:
+        listed = await client.call_tool("list_canned_queries")
+        executed = await client.call_tool(
+            "execute_canned_query",
+            {"database": "test", "query": "secret_sql"},
+        )
+
+    assert listed.structured_content == {"queries": []}
+    assert "does not exist or is not available" in tool_error_text(executed)
+
+
+@pytest.mark.asyncio
+async def test_canned_query_permissions_use_http_actor(canned_datasette):
+    actor_cookie = canned_datasette.sign({"a": {"id": "allowed"}}, "actor")
+
+    app = canned_datasette.app()
+    async with run_asgi_lifespan(app):
+        async with mcp_client_for_app(app) as anonymous_client:
+            anonymous_read = await anonymous_client.call_tool(
+                "execute_canned_query",
+                {"database": "test", "query": "private_query"},
+            )
+            anonymous_write = await anonymous_client.call_tool(
+                "execute_writable_canned_query",
+                {
+                    "database": "test",
+                    "query": "add_author_as_actor",
+                    "parameters": {"name": "Anon"},
+                },
+            )
+        async with mcp_client_for_app(
+            app,
+            cookies={"ds_actor": actor_cookie},
+        ) as allowed_client:
+            listed = await allowed_client.call_tool(
+                "list_canned_queries", {"database": "test"}
+            )
+            allowed_write = await allowed_client.call_tool(
+                "execute_writable_canned_query",
+                {
+                    "database": "test",
+                    "query": "add_author_as_actor",
+                    "parameters": {"name": "Barbara"},
+                },
+            )
+            allowed_read = await allowed_client.call_tool(
+                "execute_canned_query",
+                {"database": "test", "query": "private_query"},
+            )
+
+    not_available = "does not exist or is not available"
+    assert not_available in tool_error_text(anonymous_read)
+    assert not_available in tool_error_text(anonymous_write)
+    listed_queries = {q["name"]: q for q in listed.structured_content["queries"]}
+    assert {"private_query", "add_author_as_actor"} <= set(listed_queries)
+    # Magic parameters are not caller-supplied parameters
+    assert listed_queries["add_author_as_actor"]["parameters"] == ["name"]
+    assert allowed_write.structured_content["rows_affected"] == 1
+    # The :_actor_id magic parameter is resolved from the HTTP request actor
+    assert allowed_read.structured_content["rows"][-1] == {"name": "BARBARA-ALLOWED"}
+
+
+@pytest.mark.skipif(
+    not HAS_STORED_QUERIES, reason="Untrusted stored queries need Datasette 1.0"
+)
+@pytest.mark.asyncio
+async def test_untrusted_stored_queries_require_sql_permissions(datasette):
+    path = datasette.get_database("test").path
+    canned = datasette_with_config(
+        [path],
+        {"plugins": CANNED_QUERIES_CONFIG["plugins"]},
+        settings={"default_allow_sql": False},
+    )
+    await canned.invoke_startup()
+    await canned.add_query(
+        "test", "untrusted_read", "select name from authors", is_trusted=False
+    )
+    await canned.add_query(
+        "test", "trusted_read", "select name from authors", is_trusted=True
+    )
+
+    async with Client(create_mcp_server(canned)) as client:
+        untrusted = await client.call_tool(
+            "execute_canned_query",
+            {"database": "test", "query": "untrusted_read"},
+        )
+        trusted = await client.call_tool(
+            "execute_canned_query",
+            {"database": "test", "query": "trusted_read"},
+        )
+
+    assert "You do not have permission to run canned query 'untrusted_read'." in (
+        tool_error_text(untrusted)
+    )
+    assert trusted.structured_content["rows"] == [{"name": "ADA"}, {"name": "GRACE"}]
