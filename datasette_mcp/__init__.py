@@ -657,25 +657,37 @@ async def _canned_query_params(
 ) -> dict[str, Any]:
     from datasette.views.database import MagicParameters
 
-    supplied = supplied or {}
-    allowed = await _canned_query_parameters(db, query)
-    unknown = sorted(set(supplied) - set(allowed))
-    if unknown:
-        raise ToolError(
-            "Unknown parameters for canned query {!r}: {}. Accepted parameters: "
-            "{}.".format(
-                query.name,
-                ", ".join(unknown),
-                ", ".join(allowed) or "none",
+    try:
+        supplied = supplied or {}
+        allowed = await _canned_query_parameters(db, query)
+        unknown = sorted(set(supplied) - set(allowed))
+        if unknown:
+            raise ToolError(
+                "Unknown parameters for canned query {!r}: {}. Accepted parameters: "
+                "{}.".format(
+                    query.name,
+                    ", ".join(unknown),
+                    ", ".join(allowed) or "none",
+                )
             )
-        )
-    params = {name: supplied.get(name, "") for name in allowed}
-    request = _datasette_request(ctx)
-    if _has_stored_queries(datasette):
-        magic_params = MagicParameters(query.sql, params, request, datasette)
-        await magic_params.execute_params()
-        return magic_params
-    return MagicParameters(params, request, datasette)
+        params = {name: supplied.get(name, "") for name in allowed}
+        request = _datasette_request(ctx)
+        if _has_stored_queries(datasette):
+            magic_params = MagicParameters(query.sql, params, request, datasette)
+            await magic_params.execute_params()
+            return magic_params
+        return MagicParameters(params, request, datasette)
+    except ToolError:
+        raise
+    except Exception as ex:
+        error_description = type(ex).__name__
+        if isinstance(ex, KeyError) and ex.args:
+            error_description += f" for key {ex.args[0]!r}"
+        raise ToolError(
+            f"Unexpected {error_description} while preparing parameters for "
+            f"canned query {query.name!r} in database {query.database!r}. "
+            "The query was not executed."
+        ) from None
 
 
 def _datasette_request(ctx: Context) -> Request:

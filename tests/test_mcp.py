@@ -11,6 +11,7 @@ import httpx2
 import pytest
 import pytest_asyncio
 
+import datasette_mcp
 from datasette_mcp import create_mcp_server, skip_csrf
 
 
@@ -864,6 +865,120 @@ async def test_canned_query_permissions_use_http_actor(canned_datasette):
     assert allowed_write.structured_content["rows_affected"] == 1
     # The :_actor_id magic parameter is resolved from the HTTP request actor
     assert allowed_read.structured_content["rows"][-1] == {"name": "BARBARA-ALLOWED"}
+
+
+@pytest.mark.parametrize(
+    "tool,query",
+    [
+        ("execute_canned_query", "author_by_name"),
+        ("execute_writable_canned_query", "add_author"),
+    ],
+)
+@pytest.mark.parametrize(
+    "error_type,error_args,error_description",
+    [
+        (KeyError, (), "KeyError"),
+        (KeyError, ("id",), "KeyError for key 'id'"),
+        (KeyError, (0,), "KeyError for key 0"),
+        (
+            RuntimeError,
+            ("Private detail: /secret/path token=secret-value",),
+            "RuntimeError",
+        ),
+    ],
+    ids=["empty-key-error", "named-key-error", "zero-key-error", "private-details"],
+)
+@pytest.mark.asyncio
+async def test_parameter_preparation_errors_reach_client(
+    canned_datasette,
+    monkeypatch,
+    tool,
+    query,
+    error_type,
+    error_args,
+    error_description,
+):
+    error = error_type(*error_args)
+
+    async def broken_parameters(db, canned_query):
+        raise error
+
+    monkeypatch.setattr(datasette_mcp, "_canned_query_parameters", broken_parameters)
+    async with mcp_http_client(canned_datasette) as client:
+        result = await client.call_tool(
+            tool,
+            {"database": "test", "query": query, "parameters": {"name": "Test"}},
+        )
+        rows = await canned_datasette.get_database("test").execute(
+            "select name from authors order by id"
+        )
+
+    message = tool_error_text(result)
+    assert (
+        f"Unexpected {error_description} while preparing parameters for "
+        f"canned query {query!r} in database 'test'."
+    ) in message
+    assert "The query was not executed." in message
+    assert "server log" not in message.lower()
+    assert "Traceback" not in message
+    assert "/secret/path" not in message
+    assert "secret-value" not in message
+    assert [row["name"] for row in rows] == ["ADA", "GRACE"]
+
+
+@pytest.mark.skipif(
+    not HAS_STORED_QUERIES, reason="Eager magic parameter resolution needs Datasette 1.0"
+)
+@pytest.mark.parametrize("write", [False, True], ids=["read", "write"])
+@pytest.mark.parametrize(
+    "actor,parameter",
+    [
+        (None, "_actor_id"),
+        ({"id": "allowed"}, "_actor_name"),
+    ],
+    ids=["no-actor", "missing-actor-field"],
+)
+@pytest.mark.asyncio
+async def test_missing_actor_parameter_reports_error_before_execution(
+    datasette, write, actor, parameter
+):
+    path = datasette.get_database("test").path
+    sql = (
+        f"insert into authors(name) values (:{parameter})"
+        if write
+        else f"select :{parameter} as actor_value"
+    )
+    canned = datasette_with_config(
+        [path],
+        {
+            "plugins": {"datasette-mcp": {"canned_queries": True}},
+            "databases": {
+                "test": {"queries": {"needs_actor": {"sql": sql, "write": write}}}
+            },
+        },
+    )
+    tool = "execute_writable_canned_query" if write else "execute_canned_query"
+    cookies = {"ds_actor": canned.sign({"a": actor}, "actor")} if actor else None
+    app = canned.app()
+    async with run_asgi_lifespan(app):
+        async with mcp_client_for_app(app, cookies=cookies) as client:
+            result = await client.call_tool(
+                tool, {"database": "test", "query": "needs_actor"}
+            )
+            rows = await canned.get_database("test").execute(
+                "select count(*) from authors"
+            )
+
+    message = tool_error_text(result)
+    assert "Unexpected KeyError" in message
+    assert (
+        "while preparing parameters for canned query "
+        "'needs_actor' in database 'test'. The query was not executed."
+    ) in message
+    if actor is not None:
+        assert "for key 'name'" in message
+    assert "server log" not in message.lower()
+    assert rows.first()[0] == 2
 
 
 @pytest.mark.skipif(
