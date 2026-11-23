@@ -478,13 +478,14 @@ def _sql_errors_as_tool_errors() -> Iterator[None]:
 
 
 def _query_results(database: str, results: Results) -> QueryResults:
+    columns = list(results.columns.names)
     rows = [
-        {column: _serialize_cell(value) for column, value in zip(results.columns, row)}
+        {column: _serialize_cell(value) for column, value in zip(columns, row)}
         for row in results.rows
     ]
     return {
         "database": database,
-        "columns": results.columns,
+        "columns": columns,
         "rows": rows,
         "truncated": results.truncated,
     }
