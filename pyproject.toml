@@ -1,6 +1,6 @@
 [project]
 name = "datasette-mcp"
-version = "0.3"
+version = "0.4"
 description = "Adds a /-/mcp MCP server to any Datasette instance"
 readme = "README.md"
 authors = [{name = "Datasette"}]
